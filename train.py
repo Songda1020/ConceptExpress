@@ -1195,7 +1195,7 @@ class ConceptExpress:
                             padding="max_length",
                             max_length=self.tokenizer.model_max_length,
                             return_tensors="pt",
-                        ).input_ids
+                        ).input_ids.to(latents.device)
 
                         # Get the text embedding for conditioning
                         encoder_hidden_states = self.text_encoder(null_input_ids)[0]
@@ -1325,6 +1325,7 @@ class ConceptExpress:
                         )
 
                         # Get the text embedding for conditioning
+                        prompt_ids = prompt_ids.to(latents.device)
                         encoder_hidden_states = self.text_encoder(prompt_ids)[0]
                         # Predict the noise residual
                         model_pred = self.unet(
@@ -1882,7 +1883,7 @@ class P2PCrossAttnProcessor:
         attention_mask=None,
     ):
         batch_size, sequence_length, _ = hidden_states.shape
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length)
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
 
         query = attn.to_q(hidden_states)
 
