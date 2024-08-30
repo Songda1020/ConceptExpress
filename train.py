@@ -1233,6 +1233,38 @@ class ConceptExpress:
                 if global_step == 0:
                     self.token_manager.split_tokens()
                 
+                elif global_step < self.args.merge_step and global_step % 15 == 0:
+                    self.token_manager.merge_tokens()
+
+                    num_tokens = self.token_manager.get_token_num()
+                    embed_add = self.accelerator.unwrap_model(
+                                self.text_encoder
+                                ).get_input_embeddings().weight.data[-self.args.num_of_assets:].detach()
+
+                    for i in range(num_tokens):
+                        new_embed = 0.
+                        for j in range(self.args.num_split_tokens):
+                            new_embed += embed_add[i + j * num_tokens]
+
+                    new_embed_avg = new_embed / self.args.num_split_tokens
+
+                    for i in range(num_tokens):
+                        embed_pos_i = self.accelerator.unwrap_model(
+                            self.text_encoder
+                        ).get_input_embeddings().weight.data[
+                            -self.args.num_of_assets+i
+                        ]
+
+                        gap_pos_i = new_embed_avg - embed_pos_i
+
+                        self.accelerator.unwrap_model(
+                            self.text_encoder
+                        ).get_input_embeddings().weight.data[
+                            -self.args.num_of_assets+i
+                        ] = embed_pos_i + 0.7 * gap_pos_i
+
+                    self.token_manager.split_tokens()
+
                 elif global_step == self.args.merge_step:
                     self.token_manager.merge_tokens()
                     
