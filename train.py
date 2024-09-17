@@ -544,8 +544,7 @@ class TokenManager():
         
         if self.mask_list is None:
             self.mask_list, self.feat_list = mask_list_new, feat_list_new
-#            self.ph_tokens_used = self.all_ph_tokens[:len(self.mask_list)]
-            self.ph_tokens_used = self.all_ph_tokens[:len(self.mask_list)] + [self.all_ph_tokens[-1]]
+            self.ph_tokens_used = self.all_ph_tokens[:len(self.mask_list)]
         else:
             self.old_to_new(mask_list_new, feat_list_new)
             
@@ -581,8 +580,7 @@ class TokenManager():
             self.mask_list = self.mask_list + mask_list_new[col_ind_not]
             self.feat_list = self.feat_list + feat_list_new[col_ind_not]
             
-#            self.ph_tokens_used = self.all_ph_tokens[:num_new]
-            self.ph_tokens_used = self.all_ph_tokens[:num_new] + self.all_ph_tokens[-1]
+            self.ph_tokens_used = self.all_ph_tokens[:num_new]
 
     def flip_mask(self, input_list):
         shape = input_list[0].shape
@@ -604,7 +602,7 @@ class TokenManager():
         
         token_ids = torch.tensor(tokens_ids_to_use)
         
-        if flip[0]:
+        if masks_to_use[0] != None and flip[0]:
             masks_to_use = self.flip_mask(masks_to_use)
             feats_to_use = self.flip_mask(feats_to_use)
         
@@ -616,23 +614,24 @@ class TokenManager():
             return_tensors="pt",
         ).input_ids
         
-        masks_to_use = torch.stack(masks_to_use, dim=0)
-        feats_to_use = torch.stack(feats_to_use, dim=0)
+        if masks_to_use[0] != None:
+            masks_to_use = torch.stack(masks_to_use, dim=0)
+            feats_to_use = torch.stack(feats_to_use, dim=0)
         
         return prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids
     
     def split_tokens(self):
         if not self.split_state:
-            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens * self.num_split_tokens]
-            self.mask_list = self.mask_list  * self.num_split_tokens
-            self.feat_list = self.feat_list * self.num_split_tokens
+            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens * self.num_split_tokens] + self.all_ph_tokens[-self.num_split_tokens:]
+            self.mask_list = self.mask_list  * self.num_split_tokens + [None] * self.num_split_tokens
+            self.feat_list = self.feat_list * self.num_split_tokens + [None] * self.num_split_tokens
             self.split_state = True
             
     def merge_tokens(self):
         if self.split_state:
-            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens]
-            self.mask_list = self.mask_list[:self.num_tokens]
-            self.feat_list = self.feat_list[:self.num_tokens]
+            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens] + [self.all_ph_tokens[-self.num_tokens]]
+            self.mask_list = self.mask_list[:self.num_tokens] + [self.mask_list[-self.num_tokens]]
+            self.feat_list = self.feat_list[:self.num_tokens] + [self.feat_list[-self.num_tokens]]
             self.split_state = False
     
     def get_token_num(self):
@@ -858,8 +857,9 @@ class ConceptExpress:
             self.args.placeholder_token.replace(">", f"{idx}>")
             for idx in range(self.args.num_of_assets)
         ]
-        self.placeholder_tokens.append(self.args.placeholder_token.replace(">", f"*>"))
-        self.args.num_of_assets += 1
+        for i in range(self.args.num_split_tokens):
+            self.placeholder_tokens.append(self.args.placeholder_token.replace(">", f"*{chr(97+i)}>"))
+        self.args.num_of_assets += self.args.num_split_tokens
         num_added_tokens = self.tokenizer.add_tokens(self.placeholder_tokens)
         assert num_added_tokens == self.args.num_of_assets
         self.placeholder_token_ids = self.tokenizer.convert_tokens_to_ids(
@@ -1337,9 +1337,7 @@ class ConceptExpress:
 
                 with self.accelerator.accumulate(self.unet):
 
-#                    model_pred_collection = []
-#                    for list_idx in range(len(prompt_ids_list)):
-                    for list_idx in range(len(prompt_ids_list)-1):
+                    for list_idx in range(len(prompt_ids_list)):
 
                         torch.cuda.empty_cache()
                         prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = \
@@ -1409,9 +1407,42 @@ class ConceptExpress:
                             model_pred.float(), target.float(), reduction="mean"
                         )
                        # if (global_step % 10) % 2 == 1:
-                       # if False:
-                       #     model_pred_collection.append(model_pred.detach())
                        #     continue
+                        
+                        if list_idx > self.token_manager.get_token_num() * self.args.num_split_tokens - 1:
+                            self.accelerator.backward(loss)
+
+                            # No need to keep the attention store
+                            self.controller.attention_store = {}
+                            self.controller.cur_step = 0
+
+                            if self.accelerator.sync_gradients:
+                                params_to_clip = (
+                                    itertools.chain(
+                                        self.unet.parameters(), self.text_encoder.parameters()
+                                    )
+                                    if self.args.train_text_encoder
+                                    else self.unet.parameters()
+                                )
+                                self.accelerator.clip_grad_norm_(
+                                    params_to_clip, self.args.max_grad_norm
+                                )
+
+                            optimizer.step()
+                            lr_scheduler.step()
+                            optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
+
+                            if global_step < self.args.phase1_train_steps:
+                                with torch.no_grad():
+                                    self.accelerator.unwrap_model(
+                                        self.text_encoder
+                                    ).get_input_embeddings().weight[
+                                        : -self.args.num_of_assets
+                                    ] = orig_embeds_params[
+                                        : -self.args.num_of_assets
+                                    ]
+
+                            continue
 
                         # Attention loss
                         attn_loss = 0.
@@ -1529,14 +1560,16 @@ class ConceptExpress:
                                     : -self.args.num_of_assets
                                 ]
 
-#                    if (global_step % 10) % 2 > 100:
-                    if True:
+                    if (global_step % 10) % 2 == 1:
+#                    if True:
 
                         prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = prompt_ids_list[-1], tokens_to_use_list[-1], masks_to_use_list[-1], feats_to_use_list[-1], token_ids_list[-1]
 
-#                        for list_idx in range(len(prompt_ids_list)-1):
-                        if True:
-                            list_idx = np.random.randint(0, len(prompt_ids_list)-1)
+                       # for list_idx in range(len(prompt_ids_list)-1):
+                       for list_idx in range(len(prompt_ids_list)-self.args.num_split_tokens):
+                        # if True:
+                            # list_idx = np.random.randint(0, len(prompt_ids_list)-1)
+                            list_idx = np.random.randint(0, len(prompt_ids_list)-self.args.num_split_tokens)
                             torch.cuda.empty_cache()
                             prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = \
                             prompt_ids_list[list_idx], tokens_to_use_list[list_idx],\
@@ -1566,15 +1599,18 @@ class ConceptExpress:
                                 latents, noise, timesteps
                             )
 
-                            # Get the text embedding for conditioning
-                            prompt_ids = prompt_ids.to(latents.device)
-                            encoder_hidden_states = self.text_encoder(prompt_ids)[0]
-                            # Predict the noise residual
-                            torch.cuda.empty_cache()
-                            model_pred = self.unet(
-                                noisy_latents, timesteps, encoder_hidden_states
-                            ).sample
-                            model_pred = model_pred.detach()
+                            self.controller.set_update_attention(False)
+                            with torch.no_grad():
+                                # Get the text embedding for conditioning
+                                prompt_ids = prompt_ids.to(latents.device)
+                                encoder_hidden_states = self.text_encoder(prompt_ids)[0]
+                                # Predict the noise residual
+                                torch.cuda.empty_cache()
+                                model_pred = self.unet(
+                                    noisy_latents, timesteps, encoder_hidden_states
+                                ).sample
+                                model_pred = model_pred.detach()
+                            self.controller.set_update_attention(True)
 
                             # Get the text embedding for conditioning
                             prompt_ids_star = prompt_ids_star.to(latents.device)
@@ -1614,17 +1650,17 @@ class ConceptExpress:
 
                                 model_pred = model_pred * max_mask
                                 
-                                target = target * max_mask
-                                # model_pred_star = model_pred_star * max_mask
+                                # target = target * max_mask
+                                model_pred_star = model_pred_star * max_mask
                                 
 
-                            loss = F.mse_loss(
-                                model_pred.float(), target.float(), reduction="mean"
-                            )
+                            # loss = F.mse_loss(
+                            #     model_pred.float(), target.float(), reduction="mean"
+                            # )
 
-                            #loss = F.mse_loss(
-                            #    model_pred.float(), model_pred_star.float(), reduction="mean"
-                            #)
+                            loss = F.mse_loss(
+                                model_pred.float(), model_pred_star.float(), reduction="mean"
+                            )
 
                             self.accelerator.backward(loss)
 
