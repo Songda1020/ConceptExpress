@@ -497,7 +497,7 @@ def parse_args(input_args=None):
         args = parser.parse_args()
 
     args.initializer_tokens = []
-   
+    
     assert len(args.initializer_tokens) == 0 or len(args.initializer_tokens) == args.num_of_assets
     args.max_train_steps = args.phase1_train_steps + args.phase2_train_steps
 
@@ -622,15 +622,15 @@ class TokenManager():
     def split_tokens(self):
         if not self.split_state:
             self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens * self.num_split_tokens] + self.all_ph_tokens[-self.num_split_tokens:]
-            self.mask_list = self.mask_list * self.num_split_tokens + [torch.full_like(self.mask_list[0], 0)] * self.num_split_tokens
-            self.feat_list = self.feat_list * self.num_split_tokens + [torch.full_like(self.mask_list[0], 0)] * self.num_split_tokens
+            self.mask_list = self.mask_list * self.num_split_tokens + [torch.full_like(self.mask_list[0], 1)] * self.num_split_tokens
+            self.feat_list = self.feat_list * self.num_split_tokens + [torch.full_like(self.feat_list[0], 1)] * self.num_split_tokens
             self.split_state = True
     
     def merge_tokens(self):
         if self.split_state:
-            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens] + [self.all_ph_tokens[-self.num_tokens]]
-            self.mask_list = self.mask_list[:self.num_tokens] + [self.mask_list[-self.num_tokens]]
-            self.feat_list = self.feat_list[:self.num_tokens] + [self.feat_list[-self.num_tokens]]
+            self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens] + [self.all_ph_tokens[-self.num_split_tokens]]
+            self.mask_list = self.mask_list[:self.num_tokens] + [self.mask_list[-self.num_split_tokens]]
+            self.feat_list = self.feat_list[:self.num_tokens] + [self.feat_list[-self.num_split_tokens]]
             self.split_state = False
     
     def get_token_num(self):
@@ -1179,7 +1179,7 @@ class ConceptExpress:
                         optimizer, lr_scheduler
                     )
                 
-                if global_step == 0:   
+                if global_step == 0:
                     with torch.no_grad():
                         latents = self.vae.encode(
                             batch["pixel_values"].to(dtype=self.weight_dtype)
@@ -1241,33 +1241,53 @@ class ConceptExpress:
                 elif global_step < self.args.merge_step and global_step % period == 0:
                     self.token_manager.merge_tokens()
 
-                    num_tokens = self.token_manager.get_token_num()
+                    # num_tokens = self.token_manager.get_token_num()
                     embed_add = self.accelerator.unwrap_model(
                                 self.text_encoder
                                 ).get_input_embeddings().weight.data[-self.args.num_of_assets:].detach()
+                    
+                    # for i in range(num_tokens):
+                    #     new_embed = 0.
+                    #     for j in range(self.args.num_split_tokens):
+                    #         new_embed += embed_add[i + j * num_tokens]
 
-                    for i in range(num_tokens):
-                        new_embed = 0.
-                        for j in range(self.args.num_split_tokens):
-                            new_embed += embed_add[i + j * num_tokens]
+                    # new_embed_avg = new_embed / self.args.num_split_tokens
 
+                    # for i in range(num_tokens):
+                    #     embed_pos_i = self.accelerator.unwrap_model(
+                    #         self.text_encoder
+                    #     ).get_input_embeddings().weight.data[
+                    #         -self.args.num_of_assets+i
+                    #     ]
+
+                    #     gap_pos_i = new_embed_avg - embed_pos_i
+
+                    #     self.accelerator.unwrap_model(
+                    #         self.text_encoder
+                    #     ).get_input_embeddings().weight.data[
+                    #         -self.args.num_of_assets+i
+                    #     ] = embed_pos_i + alpha * gap_pos_i
+                    
+                    embed_pos_star = self.accelerator.unwrap_model(
+                        self.text_encoder
+                    ).get_input_embeddings().weight.data[
+                        -self.args.num_split_tokens
+                    ]
+                    
+                    new_embed = 0.
+                    for j in range(self.args.num_split_tokens):
+                        new_embed += embed_add[-self.args.num_split_tokens + j]
+                        
                     new_embed_avg = new_embed / self.args.num_split_tokens
-
-                    for i in range(num_tokens):
-                        embed_pos_i = self.accelerator.unwrap_model(
-                            self.text_encoder
-                        ).get_input_embeddings().weight.data[
-                            -self.args.num_of_assets+i
-                        ]
-
-                        gap_pos_i = new_embed_avg - embed_pos_i
-
-                        self.accelerator.unwrap_model(
-                            self.text_encoder
-                        ).get_input_embeddings().weight.data[
-                            -self.args.num_of_assets+i
-                        ] = embed_pos_i + alpha * gap_pos_i
-
+                    
+                    gap_pos_star = new_embed_avg - embed_pos_star
+                    
+                    self.accelerator.unwrap_model(
+                        self.text_encoder
+                    ).get_input_embeddings().weight.data[
+                        -self.args.num_split_tokens
+                    ] = embed_pos_star + alpha * gap_pos_star 
+                    
                     self.token_manager.split_tokens()
 
                 elif global_step == self.args.merge_step:
@@ -1297,13 +1317,12 @@ class ConceptExpress:
                             self.text_encoder
                         ).get_input_embeddings().weight.data[
                             -self.args.num_split_tokens
-                        ] = new_embed / self.args.num_split_tokens                 
-                    
+                        ] = new_embed / self.args.num_split_tokens
                     
                     if self.accelerator.is_main_process:
                         save_path = os.path.join(self.args.output_dir, f"learned_embeds-merging-step.bin")
                         placeholder_token, placeholder_token_id = self.token_manager.current_tokens(self.tokenizer)
-                       
+                        
                         learned_embeds_dict = save_progress(self.text_encoder, placeholder_token, placeholder_token_id, self.accelerator, save_path)
                         test_generation(self.args, placeholder_token, learned_embeds_dict, 'merging', self.token_manager.split_state)
                 
@@ -1411,7 +1430,7 @@ class ConceptExpress:
                             pil = (batch["pixel_values"][0] * 0.5 + 0.5) 
                             pil = T.ToPILImage()(pil)
                             image_masked_save = self.vis_masked_image(pil, max_mask_np)
-
+                            
                             model_pred = model_pred * max_mask
                             target = target * max_mask
                             
@@ -1419,7 +1438,7 @@ class ConceptExpress:
                             model_pred.float(), target.float(), reduction="mean"
                         )
                         
-                        if list_idx > self.token_manager.get_token_num() * self.args.num_split_tokens - self.args.num_split_tokens:
+                        if list_idx > self.token_manager.get_token_num() * self.args.num_split_tokens - 1:
                             self.accelerator.backward(loss)
 
                             # No need to keep the attention store
@@ -1456,7 +1475,11 @@ class ConceptExpress:
 
                         # Attention loss
                         attn_loss = 0.
+                        
                         for batch_idx in range(self.args.train_batch_size):
+                            if not self.token_manager.split_state:
+                                if list_idx > self.token_manager.get_token_num() - 1:
+                                    break
                             feats_to_use = feats_to_use.reshape(-1,64,64)
                             GT_feats = F.interpolate(
                                 input=feats_to_use.unsqueeze(1), size=(16, 16)
@@ -1474,10 +1497,11 @@ class ConceptExpress:
                             curr_cond_batch_idx = self.args.train_batch_size + batch_idx
                             
                             for mask_id in range(len(GT_feats)):
+                                
                                 curr_placeholder_token_id = self.placeholder_token_ids[
                                     token_ids[mask_id]
                                 ]
-
+                                
                                 asset_idx = (
                                     (
                                         prompt_ids[batch_idx]
@@ -1514,12 +1538,13 @@ class ConceptExpress:
                         else: # merge
                             attention_weight = self.args.lambda_attention
                             
-                        attn_loss = attention_weight * (
-                            attn_loss / self.args.train_batch_size
-                        )
-                        
-                        logs["attn_loss"] = attn_loss.detach().item()
-                        loss += attn_loss
+                        if self.token_manager.split_state or list_idx < self.token_manager.get_token_num():                                
+                            attn_loss = attention_weight * (
+                                attn_loss / self.args.train_batch_size
+                            )
+                            
+                            logs["attn_loss"] = attn_loss.detach().item()
+                            loss += attn_loss
                         
                         if self.token_manager.split_state:
                             # converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
@@ -1575,10 +1600,10 @@ class ConceptExpress:
                     if (global_step % 10) % 2 == 1:
 
                         prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = prompt_ids_list[-1], tokens_to_use_list[-1], masks_to_use_list[-1], feats_to_use_list[-1], token_ids_list[-1]
-
+                        
                         for list_idx in range(len(prompt_ids_list)-self.args.num_split_tokens):
                         # if True:
-                            list_idx = np.random.randint(0, len(prompt_ids_list)-self.args.num_split_tokens)
+                        #     list_idx = np.random.randint(0, len(prompt_ids_list)-self.args.num_split_tokens)
                             torch.cuda.empty_cache()
                             prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = \
                             prompt_ids_list[list_idx], tokens_to_use_list[list_idx],\
@@ -1622,8 +1647,6 @@ class ConceptExpress:
                             self.controller.set_update_attention(True)
 
                             # Get the text embedding for conditioning
-                            # noisy_latents_star = noisy_latents.detach().clone().to(latents.device)
-                            # timesteps_star = timesteps.detach().clone().to(latents.device)
                             prompt_ids_star = prompt_ids_star.to(latents.device)
                             encoder_hidden_states_star = self.text_encoder(prompt_ids_star)[0]
                             # Predict the noise residual
