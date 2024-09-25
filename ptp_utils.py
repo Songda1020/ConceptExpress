@@ -142,7 +142,8 @@ class AttentionControl(abc.ABC):
         if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
             self.cur_att_layer = 0
             self.cur_step += 1
-            self.between_steps()
+            if self.update_attention:
+                self.between_steps()
         return attn
 
     def reset(self):
@@ -153,6 +154,10 @@ class AttentionControl(abc.ABC):
         self.cur_step = 0
         self.num_att_layers = -1
         self.cur_att_layer = 0
+        self.update_attention = True
+
+    def set_update_attention(self, update):
+        self.update_attention = update
 
 
 class EmptyControl(AttentionControl):
