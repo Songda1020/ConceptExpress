@@ -1597,6 +1597,93 @@ class ConceptExpress:
                                     : -self.args.num_of_assets
                                 ]
 
+                    # A cross attention loss version
+                    
+                    converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
+                                                          add_special_tokens=False, return_tensors='pt')
+                    # star_id = converted_ids[0][-1].to(latents.device)
+                    # star_input_ids = prompt_ids_list[-1].to(latents.device)
+                    star_id = converted_ids[0][-self.args.num_split_tokens].to(latents.device)
+                    star_input_ids = prompt_ids_list[-self.args.num_split_tokens].to(latents.device)
+                    
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = self.text_encoder(star_input_ids)[0]
+                    
+                    with torch.no_grad():
+                        # Convert images to latent space
+                        latents = self.vae.encode(
+                            batch["pixel_values"].to(dtype=self.weight_dtype)
+                        ).latent_dist.sample()
+                        latents = latents * 0.18215
+
+                        # Sample noise that we'll add to the latents
+                        noise = torch.randn_like(latents)
+                        bsz = latents.shape[0]
+                        # Sample a random timestep for each image
+                        timesteps = torch.randint(
+                            0,
+                            self.noise_scheduler.config.num_train_timesteps,
+                            (bsz,),
+                            device=latents.device,
+                        )
+                        timesteps = timesteps.long()
+                    
+                        # Add noise to the latents according to the noise magnitude at each timestep
+                        # (this is the forward diffusion process)
+                        noisy_latents = self.noise_scheduler.add_noise(
+                            latents, noise, timesteps
+                        )
+                    
+                        # Predict the noise residual
+                        model_pred = self.unet(
+                            noisy_latents, timesteps, encoder_hidden_states
+                        ).sample
+                    
+                    agg_attn = self.aggregate_attention(
+                        res=16,
+                        from_where=("up", "down"),
+                        is_cross=True,
+                        select=0,
+                        )
+                    
+                    star_idx = (
+                        (
+                            star_input_ids[0] == star_id
+                            )
+                            .nonzero()
+                            .item()
+                        )
+                    
+                    star_attn_mask = agg_attn[..., star_idx]
+                    star_attn_mask1 = star_attn_mask.reshape(-1)
+                    
+                    transform = T.ToPILImage()
+                    attn_norm = star_attn_mask1 / star_attn_mask1.max()
+                    attn_norm = transform(attn_norm.reshape(16,16))
+                    attn_norm /= np.max(attn_norm)
+                    
+                    star_mask = torch.tensor(np.array(attn_norm).astype("float")).clone().detach().to(latents.device)
+                    
+                    with torch.no_grad():
+                        mask_sum = 0
+                        for i in range(len(mask_list)):
+                            mask_sum += mask_list[i]
+                    mask_sum_16 = mask_sum[::4, ::4].clone().detach().requires_grad_(True).to(latents.device)
+                    
+                    loss = F.mse_loss(
+                        star_mask.float(), mask_sum_16.float(), reduction="mean"
+                    )
+                    
+                    self.accelerator.backward(loss)
+                    
+                    # No need to keep the attention store
+                    self.controller.attention_store = {}
+                    self.controller.cur_step = 0
+                    
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
+
                     if (global_step % 10) % 2 == 1:
 
                         prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = prompt_ids_list[-1], tokens_to_use_list[-1], masks_to_use_list[-1], feats_to_use_list[-1], token_ids_list[-1]
