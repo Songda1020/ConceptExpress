@@ -1601,10 +1601,13 @@ class ConceptExpress:
                     
                     converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
                                                           add_special_tokens=False, return_tensors='pt')
-                    # star_id = converted_ids[0][-1].to(latents.device)
-                    # star_input_ids = prompt_ids_list[-1].to(latents.device)
-                    star_id = converted_ids[0][-self.args.num_split_tokens].to(latents.device)
-                    star_input_ids = prompt_ids_list[-self.args.num_split_tokens].to(latents.device)
+                    
+                    if self.token_manager.split_state:
+                        star_id = converted_ids[0][-self.args.num_split_tokens].to(latents.device)
+                        star_input_ids = prompt_ids_list[-self.args.num_split_tokens].to(latents.device)
+                    else:
+                        star_id = converted_ids[0][-1].to(latents.device)
+                        star_input_ids = prompt_ids_list[-1].to(latents.device)
                     
                     # Get the text embedding for conditioning
                     encoder_hidden_states = self.text_encoder(star_input_ids)[0]
@@ -1683,12 +1686,18 @@ class ConceptExpress:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
-
+                    
                     if (global_step % 10) % 2 == 1:
 
-                        prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = prompt_ids_list[-1], tokens_to_use_list[-1], masks_to_use_list[-1], feats_to_use_list[-1], token_ids_list[-1]
+                        if self.token_manager.split_state:
+                            num_split_tokens = self.args.num_split_tokens
+                        else:
+                            num_split_tokens = 1
                         
-                        for list_idx in range(len(prompt_ids_list)-self.args.num_split_tokens):
+                        prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = prompt_ids_list[-num_split_tokens], tokens_to_use_list[-num_split_tokens], masks_to_use_list[-num_split_tokens], feats_to_use_list[-num_split_tokens], token_ids_list[-num_split_tokens]
+                        
+                        # TODO should be num_split_tokens?
+                        for list_idx in range(len(prompt_ids_list)-num_split_tokens):
                         # if True:
                         #     list_idx = np.random.randint(0, len(prompt_ids_list)-self.args.num_split_tokens)
                             torch.cuda.empty_cache()
