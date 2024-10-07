@@ -602,19 +602,6 @@ class TokenManager():
         
         token_ids = torch.tensor(tokens_ids_to_use)
         
-        if self.split_state:
-            num_split_tokens = self.num_split_tokens
-        else:
-            num_split_tokens = 1
-        
-        tokens_ids_global = []
-        for tokens_id in tokens_ids_to_use:
-            if tokens_id < len(self.ph_tokens_used) - num_split_tokens:
-                tokens_ids_global.append(tokens_id)
-            else:
-                tokens_ids_global.append(tokens_id + len(self.all_ph_tokens) - len(self.ph_tokens_used) - self.num_split_tokens + num_split_tokens)
-        token_ids = torch.tensor(tokens_ids_global)
-        
         if flip[0]:
             masks_to_use = self.flip_mask(masks_to_use)
             feats_to_use = self.flip_mask(feats_to_use)
@@ -1451,21 +1438,48 @@ class ConceptExpress:
                             model_pred.float(), target.float(), reduction="mean"
                         )
                         
-                        if self.token_manager.split_state:
-                            num_split_tokens = self.args.num_split_tokens
-                        else:
-                            num_split_tokens = 1
-                        
-                        if list_idx > (self.token_manager.get_token_num() - 1) * num_split_tokens - 1:
-                            pass
+                        if list_idx > self.token_manager.get_token_num() * self.args.num_split_tokens - 1:
+                            self.accelerator.backward(loss)
+
+                            # No need to keep the attention store
+                            self.controller.attention_store = {}
+                            self.controller.cur_step = 0
+
+                            if self.accelerator.sync_gradients:
+                                params_to_clip = (
+                                    itertools.chain(
+                                        self.unet.parameters(), self.text_encoder.parameters()
+                                    )
+                                    if self.args.train_text_encoder
+                                    else self.unet.parameters()
+                                )
+                                self.accelerator.clip_grad_norm_(
+                                    params_to_clip, self.args.max_grad_norm
+                                )
+
+                            optimizer.step()
+                            lr_scheduler.step()
+                            optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
+
+                            if global_step < self.args.phase1_train_steps:
+                                with torch.no_grad():
+                                    self.accelerator.unwrap_model(
+                                        self.text_encoder
+                                    ).get_input_embeddings().weight[
+                                        : -self.args.num_of_assets
+                                    ] = orig_embeds_params[
+                                        : -self.args.num_of_assets
+                                    ]
+
+                            continue
 
                         # Attention loss
                         attn_loss = 0.
                         
                         for batch_idx in range(self.args.train_batch_size):
-                            # if not self.token_manager.split_state:
-                            #     if list_idx > self.token_manager.get_token_num() - 1:
-                            #         break
+                            if not self.token_manager.split_state:
+                                if list_idx > self.token_manager.get_token_num() - 1:
+                                    break
                             feats_to_use = feats_to_use.reshape(-1,64,64)
                             GT_feats = F.interpolate(
                                 input=feats_to_use.unsqueeze(1), size=(16, 16)
@@ -1524,8 +1538,7 @@ class ConceptExpress:
                         else: # merge
                             attention_weight = self.args.lambda_attention
                             
-                        # if self.token_manager.split_state or list_idx < self.token_manager.get_token_num():
-                        if True:
+                        if self.token_manager.split_state or list_idx < self.token_manager.get_token_num():                                
                             attn_loss = attention_weight * (
                                 attn_loss / self.args.train_batch_size
                             )
@@ -1534,7 +1547,6 @@ class ConceptExpress:
                             loss += attn_loss
                         
                         if self.token_manager.split_state:
-                            # We do not need to push the fused concept away from the existing concepts, thus we do not design a new contrastive loss for it.
                             # converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
                             #                                       add_special_tokens=False, return_tensors='pt')
                             converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list[:-self.args.num_split_tokens]], 
@@ -1554,21 +1566,48 @@ class ConceptExpress:
                             
                             loss += loss_con * self.args.weight_contrast
 
-                    # The additional modules
-                    
-                    if self.token_manager.split_state:
-                        num_split_tokens = self.args.num_split_tokens
-                    else:
-                        num_split_tokens = 1 + 1
+                        self.accelerator.backward(loss)
 
-                    # The cross attention loss module as a regularization to solve the multiple object problem
-                    # Use the attention map of v_star to implicitly regularize the learning of the fused concept v_star
+                        # No need to keep the attention store
+                        self.controller.attention_store = {}
+                        self.controller.cur_step = 0
+
+                        if self.accelerator.sync_gradients:
+                            params_to_clip = (
+                                itertools.chain(
+                                    self.unet.parameters(), self.text_encoder.parameters()
+                                )
+                                if self.args.train_text_encoder
+                                else self.unet.parameters()
+                            )
+                            self.accelerator.clip_grad_norm_(
+                                params_to_clip, self.args.max_grad_norm
+                            )
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
+                        
+                        if global_step < self.args.phase1_train_steps:
+                            with torch.no_grad():
+                                self.accelerator.unwrap_model(
+                                    self.text_encoder
+                                ).get_input_embeddings().weight[
+                                    : -self.args.num_of_assets
+                                ] = orig_embeds_params[
+                                    : -self.args.num_of_assets
+                                ]
+
+                    # A cross attention loss version
                     
                     converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
                                                           add_special_tokens=False, return_tensors='pt')
                     
-                    star_id = converted_ids[0][-num_split_tokens].to(latents.device)
-                    star_input_ids = prompt_ids_list[-num_split_tokens].to(latents.device)
+                    if self.token_manager.split_state:
+                        star_id = converted_ids[0][-self.args.num_split_tokens].to(latents.device)
+                        star_input_ids = prompt_ids_list[-self.args.num_split_tokens].to(latents.device)
+                    else:
+                        star_id = converted_ids[0][-1].to(latents.device)
+                        star_input_ids = prompt_ids_list[-1].to(latents.device)
                     
                     # Get the text embedding for conditioning
                     encoder_hidden_states = self.text_encoder(star_input_ids)[0]
@@ -1627,7 +1666,6 @@ class ConceptExpress:
                     attn_norm /= np.max(attn_norm)
                     
                     star_mask = torch.tensor(np.array(attn_norm).astype("float")).clone().detach().to(latents.device)
-                    # print(sum(star_mask))
                     
                     with torch.no_grad():
                         mask_sum = 0
@@ -1649,16 +1687,17 @@ class ConceptExpress:
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
                     
-                    logs["loss_2"] = loss.detach().item()
-                    
-                    # minimize the epsilon mse loss to learn the confused embeddings v_star using mse loss function
-                    
                     if (global_step % 10) % 2 == 1:
+
+                        if self.token_manager.split_state:
+                            num_split_tokens = self.args.num_split_tokens
+                        else:
+                            num_split_tokens = 1
                         
                         prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = prompt_ids_list[-num_split_tokens], tokens_to_use_list[-num_split_tokens], masks_to_use_list[-num_split_tokens], feats_to_use_list[-num_split_tokens], token_ids_list[-num_split_tokens]
                         
-                        # for list_idx in range(len(prompt_ids_list)-num_split_tokens):
-                        for list_idx in range(len(prompt_ids_list)):
+                        # TODO should be num_split_tokens?
+                        for list_idx in range(len(prompt_ids_list)-num_split_tokens):
                         # if True:
                         #     list_idx = np.random.randint(0, len(prompt_ids_list)-self.args.num_split_tokens)
                             torch.cuda.empty_cache()
@@ -1744,6 +1783,7 @@ class ConceptExpress:
                                 # target = target * max_mask
                                 model_pred_star = model_pred_star * max_mask
                                 
+
                             # loss = F.mse_loss(
                             #     model_pred.float(), target.float(), reduction="mean"
                             # )
@@ -2194,7 +2234,7 @@ class P2PCrossAttnProcessor:
         is_cross = encoder_hidden_states is not None
         encoder_hidden_states = (
             encoder_hidden_states
-            if encoder_hidden_states is not None
+            if encoder_hidden_states is not Non
             else hidden_states
         )
         key = attn.to_k(encoder_hidden_states)
