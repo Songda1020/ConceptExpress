@@ -600,8 +600,6 @@ class TokenManager():
         masks_to_use = [self.mask_list[tkn_i] for tkn_i in tokens_ids_to_use]
         feats_to_use = [self.feat_list[tkn_i] for tkn_i in tokens_ids_to_use]
         
-        token_ids = torch.tensor(tokens_ids_to_use)
-        
         if self.split_state:
             num_split_tokens = self.num_split_tokens
         else:
@@ -613,6 +611,7 @@ class TokenManager():
                 tokens_ids_global.append(tokens_id)
             else:
                 tokens_ids_global.append(tokens_id + len(self.all_ph_tokens) - len(self.ph_tokens_used) - self.num_split_tokens + num_split_tokens)
+        # token_ids = torch.tensor(tokens_ids_to_use)
         token_ids = torch.tensor(tokens_ids_global)
         
         if flip[0]:
@@ -634,9 +633,22 @@ class TokenManager():
     
     def split_tokens(self):
         if not self.split_state:
+            masks_to_use = torch.stack(self.mask_list, dim=0)
+            feats_to_use = torch.stack(self.feat_list, dim=0)
+            mask_star = torch.max(
+                masks_to_use, dim=0, keepdim=True
+            ).values.squeeze(0) # shape? unsqueeze?
+            feat_star = torch.mean(
+                feats_to_use, dim=0, keepdim=True
+            ).squeeze(0) # shape?
+            
             self.ph_tokens_used = self.all_ph_tokens[:self.num_tokens * self.num_split_tokens] + self.all_ph_tokens[-self.num_split_tokens:]
-            self.mask_list = self.mask_list * self.num_split_tokens + [torch.full_like(self.mask_list[0], 1)] * self.num_split_tokens
-            self.feat_list = self.feat_list * self.num_split_tokens + [torch.full_like(self.feat_list[0], 1)] * self.num_split_tokens
+            # self.mask_list = self.mask_list * self.num_split_tokens + [torch.full_like(self.mask_list[0], 1)] * self.num_split_tokens
+            self.mask_list = self.mask_list * self.num_split_tokens + [mask_star] * self.num_split_tokens
+            print(self.mask_list[0].shape)
+            print(mask_star.shape)
+            # self.feat_list = self.feat_list * self.num_split_tokens + [torch.full_like(self.feat_list[0], 1)] * self.num_split_tokens
+            self.feat_list = self.feat_list * self.num_split_tokens + [feat_star] * self.num_split_tokens
             self.split_state = True
     
     def merge_tokens(self):
@@ -665,6 +677,20 @@ class TokenManager():
             token_ids_list.append(token_ids)
         
         if not self.split_state:
+            # prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token(list(range(len(self.ph_tokens_used))), flip, bsz)
+            prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token(list(range(len(self.ph_tokens_used) - 1)), flip, bsz)
+            prompt_ids_list.append(prompt_ids)
+            tokens_to_use_list.append(tokens_to_use)
+            masks_to_use_list.append(masks_to_use)
+            feats_to_use_list.append(feats_to_use)
+            token_ids_list.append(token_ids)
+            for i in range(len(self.ph_tokens_used) - 1):
+                prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token([i, len(self.ph_tokens_used) - 1], flip, bsz)
+                prompt_ids_list.append(prompt_ids)
+                tokens_to_use_list.append(tokens_to_use)
+                masks_to_use_list.append(masks_to_use)
+                feats_to_use_list.append(feats_to_use)
+                token_ids_list.append(token_ids)
             prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token(list(range(len(self.ph_tokens_used))), flip, bsz)
             prompt_ids_list.append(prompt_ids)
             tokens_to_use_list.append(tokens_to_use)
@@ -1236,11 +1262,16 @@ class ConceptExpress:
                                 .item()
                             )
                         eot_attn_mask = agg_attn[..., eot_idx]
-                            
+                        
                         # if self.accelerator.is_main_process:
                         mask_list, feat_list = self.get_self_attention(eot_attn_mask, batch["pixel_values"][0], global_step)
                         
                         self.token_manager.update_mask(mask_list, feat_list, batch["flip"])
+                        
+                        prompt_ids_list, tokens_to_use_list, masks_to_use_list, feats_to_use_list, token_ids_list = self.token_manager.loader(batch["flip"], bsz)
+                        
+                        converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
+                                                              add_special_tokens=False, return_tensors='pt')
                         
                         # No need to keep the attention store
                         self.controller.attention_store = {}
@@ -1380,8 +1411,19 @@ class ConceptExpress:
                     continue
 
                 with self.accelerator.accumulate(self.unet):
+                    
+                    # for the cross attention regularization of v*
+                    cross_attn_list = []
 
                     for list_idx in range(len(prompt_ids_list)):
+                        # If self.token_manager.split_state is True,
+                        # we have (self.token_manager.get_token_num() + 2) + (self.token_manager.get_token_num() + 1) == len(prompt_ids_list),
+                        # where list_idx corresponds to the token v* when list_idx == self.token_manager.get_token_num(),
+                        # list_idx corresponds to the prompt "v_1 and v_2 and ... and v_{self.token_manager.get_token_num()}" 
+                        # when list_idx == self.token_manager.get_token_num() + 1,
+                        # list_idx == self.token_manager.get_token_num() + 1 + i corresponds to the prompt "v_i and v*", and
+                        # list_idx corresponds to the prompt "v_1 and v_2 and ... and v_{self.token_manager.get_token_num()} and v*"
+                        # when list_idx == self.token_manager.get_token_num() + 1 + self.token_manager.get_token_num() + 1
 
                         torch.cuda.empty_cache()
                         prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = \
@@ -1450,6 +1492,8 @@ class ConceptExpress:
                         loss = F.mse_loss(
                             model_pred.float(), target.float(), reduction="mean"
                         )
+                        if self.token_manager.split_state and list_idx > self.token_manager.get_token_num() + 1:
+                            loss = 0.
                         
                         if self.token_manager.split_state:
                             num_split_tokens = self.args.num_split_tokens
@@ -1464,7 +1508,7 @@ class ConceptExpress:
                         
                         for batch_idx in range(self.args.train_batch_size):
                             # if not self.token_manager.split_state:
-                            #     if list_idx > self.token_manager.get_token_num() - 1:
+                            #     if list_idx == self.token_manager.get_token_num():
                             #         break
                             feats_to_use = feats_to_use.reshape(-1,64,64)
                             GT_feats = F.interpolate(
@@ -1499,6 +1543,11 @@ class ConceptExpress:
                                 asset_attn_mask = agg_attn[..., asset_idx]
                                 feat_target = GT_feats[mask_id, 0].detach()
                                 
+                                if not self.token_manager.split_state:
+                                    if list_idx == self.token_manager.get_token_num(): # the index of v*
+                                        break
+                                # print("i", list_idx)
+                                
                                 attn_loss += wasser_loss(
                                     feat_target.float(),
                                     asset_attn_mask.float(),
@@ -1523,15 +1572,47 @@ class ConceptExpress:
                             attention_weight = self.args.lambda_attention
                         else: # merge
                             attention_weight = self.args.lambda_attention
-
-                        if True:
-                        # if self.token_manager.split_state or list_idx < self.token_manager.get_token_num():
+                            
+                        if self.token_manager.split_state or list_idx != self.token_manager.get_token_num():
+                        # if True:
                             attn_loss = attention_weight * (
                                 attn_loss / self.args.train_batch_size
                             )
                             
                             logs["attn_loss"] = attn_loss.detach().item()
                             loss += attn_loss
+                        
+                        attn_loss_star = 0.
+                        # TODO the cross attention module
+                        if not self.token_manager.split_state:
+                            
+                            # if list_idx < len(prompt_ids_list) - 2:
+                            if list_idx < self.token_manager.get_token_num():
+                                cross_attn_list.append(asset_attn_mask.detach().clone())
+                                # cross_attn_list.append(torch.tensor(asset_attn_mask.detach().cpu().numpy()).to(latents.device))
+                            
+                            # if list_idx == len(prompt_ids_list) - 2:
+                            # if list_idx == self.token_manager.get_token_num():
+                            if list_idx > self.token_manager.get_token_num() + 1:
+                                # print("*", list_idx)
+                                # for i in range(len(cross_attn_list)):
+                                    # print(cross_attn_list[i])
+                                    # print(asset_attn_mask)
+                                    # asset_attn_mask = asset_attn_mask.clone()
+                                    # attn_loss_star += wasser_loss(
+                                    #     cross_attn_list[i].float(),
+                                    #     asset_attn_mask.float(),
+                                    # )
+                                    # attn_loss_star = F.mse_loss(
+                                    #     asset_attn_mask.float(), asset_attn_mask.float(), reduction="mean"
+                                    # )
+                                asset_attn_mask = asset_attn_mask.clone()
+                                attn_loss_star += wasser_loss(
+                                    cross_attn_list[list_idx - (self.token_manager.get_token_num() + 1)].float(),
+                                    asset_attn_mask.float(),
+                                )
+                            
+                            loss += attn_loss_star
                         
                         if self.token_manager.split_state:
                             # We do not need to push the fused concept away from the existing concepts, thus we do not design a new contrastive loss for it.
@@ -1553,11 +1634,6 @@ class ConceptExpress:
                             loss_con = self.contrastive_loss(sample_embeddings_normalized, labels=label)
                             
                             loss += loss_con * self.args.weight_contrast
-                        
-                        # TODO the cross attention module
-                        if not self.token_manager.split_state:
-                            if list_idx < len(prompt_ids_list) - 2:
-                                pass
 
                         self.accelerator.backward(loss)
 
@@ -1589,102 +1665,106 @@ class ConceptExpress:
                                 ] = orig_embeds_params[
                                     : -self.args.num_of_assets
                                 ]
-
-                    # The additional modules
+               
+                    logs["loss"] = loss.detach().item()
+                    
+                    # TODO the additional modules
                     
                     if self.token_manager.split_state:
                         num_split_tokens = self.args.num_split_tokens
                     else:
                         num_split_tokens = 1 + 1
-
+                    
                     # The cross attention loss module as a regularization to solve the multiple object problem
                     # Use the attention map of v_star to implicitly regularize the learning of the fused concept v_star
                     
-                    converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
-                                                          add_special_tokens=False, return_tensors='pt')
+                    # converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list], 
+                    #                                       add_special_tokens=False, return_tensors='pt')
                     
-                    star_id = converted_ids[0][-num_split_tokens].to(latents.device)
-                    star_input_ids = prompt_ids_list[-num_split_tokens].to(latents.device)
+                    # star_id = converted_ids[0][-num_split_tokens].to(latents.device)
+                    # star_input_ids = prompt_ids_list[-num_split_tokens].to(latents.device)
                     
-                    # Get the text embedding for conditioning
-                    encoder_hidden_states = self.text_encoder(star_input_ids)[0]
+                    # # Get the text embedding for conditioning
+                    # encoder_hidden_states = self.text_encoder(star_input_ids)[0]
                     
-                    with torch.no_grad():
-                        # Convert images to latent space
-                        latents = self.vae.encode(
-                            batch["pixel_values"].to(dtype=self.weight_dtype)
-                        ).latent_dist.sample()
-                        latents = latents * 0.18215
+                    # with torch.no_grad():
+                    #     # Convert images to latent space
+                    #     latents = self.vae.encode(
+                    #         batch["pixel_values"].to(dtype=self.weight_dtype)
+                    #     ).latent_dist.sample()
+                    #     latents = latents * 0.18215
 
-                        # Sample noise that we'll add to the latents
-                        noise = torch.randn_like(latents)
-                        bsz = latents.shape[0]
-                        # Sample a random timestep for each image
-                        timesteps = torch.randint(
-                            0,
-                            self.noise_scheduler.config.num_train_timesteps,
-                            (bsz,),
-                            device=latents.device,
-                        )
-                        timesteps = timesteps.long()
+                    #     # Sample noise that we'll add to the latents
+                    #     noise = torch.randn_like(latents)
+                    #     bsz = latents.shape[0]
+                    #     # Sample a random timestep for each image
+                    #     timesteps = torch.randint(
+                    #         0,
+                    #         self.noise_scheduler.config.num_train_timesteps,
+                    #         (bsz,),
+                    #         device=latents.device,
+                    #     )
+                    #     timesteps = timesteps.long()
                     
-                        # Add noise to the latents according to the noise magnitude at each timestep
-                        # (this is the forward diffusion process)
-                        noisy_latents = self.noise_scheduler.add_noise(
-                            latents, noise, timesteps
-                        )
+                    #     # Add noise to the latents according to the noise magnitude at each timestep
+                    #     # (this is the forward diffusion process)
+                    #     noisy_latents = self.noise_scheduler.add_noise(
+                    #         latents, noise, timesteps
+                    #     )
                     
-                        # Predict the noise residual
-                        model_pred = self.unet(
-                            noisy_latents, timesteps, encoder_hidden_states
-                        ).sample
+                    #     # Predict the noise residual
+                    #     model_pred = self.unet(
+                    #         noisy_latents, timesteps, encoder_hidden_states
+                    #     ).sample
                     
-                    agg_attn = self.aggregate_attention(
-                        res=16,
-                        from_where=("up", "down"),
-                        is_cross=True,
-                        select=0,
-                        )
+                    # agg_attn = self.aggregate_attention(
+                    #     res=16,
+                    #     from_where=("up", "down"),
+                    #     is_cross=True,
+                    #     select=0,
+                    #     )
                     
-                    star_idx = (
-                        (
-                            star_input_ids[0] == star_id
-                            )
-                            .nonzero()
-                            .item()
-                        )
+                    # star_idx = (
+                    #     (
+                    #         star_input_ids[0] == star_id
+                    #         )
+                    #         .nonzero()
+                    #         .item()
+                    #     )
                     
-                    star_attn_mask = agg_attn[..., star_idx]
-                    star_attn_mask1 = star_attn_mask.reshape(-1)
+                    # star_attn_mask = agg_attn[..., star_idx]
+                    # star_attn_mask1 = star_attn_mask.reshape(-1)
                     
-                    transform = T.ToPILImage()
-                    attn_norm = star_attn_mask1 / star_attn_mask1.max()
-                    attn_norm = transform(attn_norm.reshape(16,16))
-                    attn_norm /= np.max(attn_norm)
+                    # transform = T.ToPILImage()
+                    # attn_norm = star_attn_mask1 / star_attn_mask1.max()
+                    # attn_norm = transform(attn_norm.reshape(16,16))
+                    # attn_norm /= np.max(attn_norm)
                     
-                    star_mask = torch.tensor(np.array(attn_norm).astype("float")).clone().detach().to(latents.device)
-                    # print(sum(star_mask))
+                    # star_mask = torch.tensor(np.array(attn_norm).astype("float")).clone().detach().to(latents.device)
+                    # # print(sum(star_mask))
                     
-                    with torch.no_grad():
-                        mask_sum = 0
-                        for i in range(len(mask_list)):
-                            mask_sum += mask_list[i]
-                    mask_sum_16 = mask_sum[::4, ::4].clone().detach().requires_grad_(True).to(latents.device)
+                    # with torch.no_grad():
+                    #     mask_sum = 0
+                    #     for i in range(len(mask_list)):
+                    #         mask_sum += mask_list[i]
+                    # mask_sum_16 = mask_sum[::4, ::4].clone().detach().requires_grad_(True).to(latents.device)
                     
-                    loss = F.mse_loss(
-                        star_mask.float(), mask_sum_16.float(), reduction="mean"
-                    )
+                    # loss = F.mse_loss(
+                    #     star_mask.float(), mask_sum_16.float(), reduction="mean"
+                    # )
                     
-                    self.accelerator.backward(loss)
+                    # self.accelerator.backward(loss)
                     
-                    # No need to keep the attention store
-                    self.controller.attention_store = {}
-                    self.controller.cur_step = 0
+                    # # No need to keep the attention store
+                    # self.controller.attention_store = {}
+                    # self.controller.cur_step = 0
                     
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
-                                        
+                    # optimizer.step()
+                    # lr_scheduler.step()
+                    # optimizer.zero_grad(set_to_none=self.args.set_grads_to_none)
+                    
+                    # logs["loss_2"] = loss.detach().item()
+                    
                     # minimize the epsilon mse loss to learn the confused embeddings v_star using mse loss function
                     
                     if (global_step % 10) % 2 == 1:
@@ -1816,6 +1896,8 @@ class ConceptExpress:
                                     ] = orig_embeds_params[
                                         : -self.args.num_of_assets
                                     ]
+                        
+                        logs["loss_1"] = loss.detach().item()
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if self.accelerator.sync_gradients:
@@ -1883,7 +1965,7 @@ class ConceptExpress:
 
                 self.accelerator.wait_for_everyone()
                 
-                logs["loss"] = loss.detach().item()
+                # logs["loss"] = loss.detach().item()
                 logs["lr"] = lr_scheduler.get_last_lr()[0]
                 progress_bar.set_postfix(**logs)
                 self.accelerator.log(logs, step=global_step)
