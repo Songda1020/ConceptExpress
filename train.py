@@ -1670,10 +1670,16 @@ class ConceptExpress:
                     
                     # TODO the additional modules
                     
+                    # if self.token_manager.split_state:
+                    #     num_split_tokens = self.args.num_split_tokens
+                    # else:
+                    #     num_split_tokens = 1 + 1
+                    
                     if self.token_manager.split_state:
                         num_split_tokens = self.args.num_split_tokens
                     else:
-                        num_split_tokens = 1 + 1
+                        num_split_tokens = 1 + 1 + self.token_manager.get_token_num() + 1
+                    print(self.token_manager.get_token_num())
                     
                     # The cross attention loss module as a regularization to solve the multiple object problem
                     # Use the attention map of v_star to implicitly regularize the learning of the fused concept v_star
