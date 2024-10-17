@@ -677,6 +677,7 @@ class TokenManager():
             token_ids_list.append(token_ids)
         
         if not self.split_state:
+            # be cautious of the index
             # prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token(list(range(len(self.ph_tokens_used))), flip, bsz)
             prompt_ids, tokens_to_use, masks_to_use, feats_to_use, token_ids = self.return_single_token(list(range(len(self.ph_tokens_used) - 1)), flip, bsz)
             prompt_ids_list.append(prompt_ids)
@@ -1492,16 +1493,16 @@ class ConceptExpress:
                         loss = F.mse_loss(
                             model_pred.float(), target.float(), reduction="mean"
                         )
-                        if self.token_manager.split_state and list_idx > self.token_manager.get_token_num() + 1:
+                        if not self.token_manager.split_state and list_idx > self.token_manager.get_token_num() + 1:
                             loss = 0.
                         
-                        if self.token_manager.split_state:
-                            num_split_tokens = self.args.num_split_tokens
-                        else:
-                            num_split_tokens = 1
+                        # if self.token_manager.split_state:
+                        #     num_split_tokens = self.args.num_split_tokens
+                        # else:
+                        #     num_split_tokens = 1
                         
-                        if list_idx > (self.token_manager.get_token_num() - 1) * num_split_tokens - 1:
-                            pass
+                        # if list_idx > (self.token_manager.get_token_num() - 1) * num_split_tokens - 1:
+                        #     pass
 
                         # Attention loss
                         attn_loss = 0.
@@ -1546,6 +1547,9 @@ class ConceptExpress:
                                 if not self.token_manager.split_state:
                                     if list_idx == self.token_manager.get_token_num(): # the index of v*
                                         break
+                                    if list_idx > self.token_manager.get_token_num() + 1:
+                                        break
+                                    
                                 # print("i", list_idx)
                                 
                                 attn_loss += wasser_loss(
@@ -1573,7 +1577,7 @@ class ConceptExpress:
                         else: # merge
                             attention_weight = self.args.lambda_attention
                             
-                        if self.token_manager.split_state or list_idx != self.token_manager.get_token_num():
+                        if self.token_manager.split_state:
                         # if True:
                             attn_loss = attention_weight * (
                                 attn_loss / self.args.train_batch_size
@@ -1582,18 +1586,29 @@ class ConceptExpress:
                             logs["attn_loss"] = attn_loss.detach().item()
                             loss += attn_loss
                         
+                        else:
+                            if list_idx < self.token_manager.get_token_num() or list_idx == self.token_manager.get_token_num() + 1:
+                                attn_loss = attention_weight * (
+                                    attn_loss / self.args.train_batch_size
+                                )
+                                
+                                logs["attn_loss"] = attn_loss.detach().item()
+                                loss += attn_loss
+                        
                         attn_loss_star = 0.
                         # TODO the cross attention module
                         if not self.token_manager.split_state:
                             
-                            # if list_idx < len(prompt_ids_list) - 2:
-                            if list_idx < self.token_manager.get_token_num():
+                            # # if list_idx < len(prompt_ids_list) - 2:
+                            # if list_idx < self.token_manager.get_token_num():
+                            #     cross_attn_list.append(asset_attn_mask.detach().clone())
+                            #     # cross_attn_list.append(torch.tensor(asset_attn_mask.detach().cpu().numpy()).to(latents.device))
+                            if list_idx == self.token_manager.get_token_num() + 1:
                                 cross_attn_list.append(asset_attn_mask.detach().clone())
-                                # cross_attn_list.append(torch.tensor(asset_attn_mask.detach().cpu().numpy()).to(latents.device))
                             
                             # if list_idx == len(prompt_ids_list) - 2:
                             # if list_idx == self.token_manager.get_token_num():
-                            if list_idx > self.token_manager.get_token_num() + 1:
+                            if list_idx > self.token_manager.get_token_num() + 1 and list_idx < 2 * self.token_manager.get_token_num() + 2:
                                 # print("*", list_idx)
                                 # for i in range(len(cross_attn_list)):
                                     # print(cross_attn_list[i])
@@ -1607,8 +1622,12 @@ class ConceptExpress:
                                     #     asset_attn_mask.float(), asset_attn_mask.float(), reduction="mean"
                                     # )
                                 asset_attn_mask = asset_attn_mask.clone()
+                                # attn_loss_star += wasser_loss(
+                                #     cross_attn_list[list_idx - (self.token_manager.get_token_num() + 2)].float(),
+                                #     asset_attn_mask.float(),
+                                # )
                                 attn_loss_star += wasser_loss(
-                                    cross_attn_list[list_idx - (self.token_manager.get_token_num() + 1)].float(),
+                                    cross_attn_list[0].float(),
                                     asset_attn_mask.float(),
                                 )
                             
@@ -1620,6 +1639,8 @@ class ConceptExpress:
                             #                                       add_special_tokens=False, return_tensors='pt')
                             converted_ids = self.tokenizer.encode([i[0] for i in tokens_to_use_list[:-self.args.num_split_tokens]], 
                                                                     add_special_tokens=False, return_tensors='pt')
+                            # print(len(tokens_to_use_list) - self.args.num_split_tokens)
+                            # print(self.token_manager.get_token_num() * self.args.num_split_tokens)
                             
                             sample_embeddings = self.accelerator.unwrap_model(
                                         self.text_encoder
@@ -1679,7 +1700,11 @@ class ConceptExpress:
                         num_split_tokens = self.args.num_split_tokens
                     else:
                         num_split_tokens = 1 + 1 + self.token_manager.get_token_num() + 1
-                    print(self.token_manager.get_token_num())
+                    
+                    # if self.token_manager.split_state:
+                    #     star_id = len(prompt_ids_list) - self.args.num_split_tokens
+                    # else:
+                    #     star_id = self.token_manager.get_token_num() + 1
                     
                     # The cross attention loss module as a regularization to solve the multiple object problem
                     # Use the attention map of v_star to implicitly regularize the learning of the fused concept v_star
@@ -1777,8 +1802,10 @@ class ConceptExpress:
                         
                         prompt_ids_star, tokens_to_use_star, masks_to_use_star, feats_to_use_star, token_ids_star = prompt_ids_list[-num_split_tokens], tokens_to_use_list[-num_split_tokens], masks_to_use_list[-num_split_tokens], feats_to_use_list[-num_split_tokens], token_ids_list[-num_split_tokens]
                         
-                        # for list_idx in range(len(prompt_ids_list)-num_split_tokens):
-                        for list_idx in range(len(prompt_ids_list)):
+                        # for list_idx in range(self.token_manager.get_token_num()):
+                        for list_idx in range(len(prompt_ids_list)-num_split_tokens):
+                            break
+                        # for list_idx in range(len(prompt_ids_list)):
                         # if True:
                         #     list_idx = np.random.randint(0, len(prompt_ids_list)-self.args.num_split_tokens)
                             torch.cuda.empty_cache()
